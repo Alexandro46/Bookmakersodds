@@ -81,6 +81,6 @@ python -m pip install -r requirements.txt
 python analyze_data.py
 ```
 
-The analysis uses the top five first divisions as its primary sample and reports the second divisions separately. It converts closing average odds to margin-adjusted probabilities, calculates log loss and Brier scores, produces calibration curves, estimates favourite and longshot gaps with match-bootstrap confidence intervals, and compares odds-only forecasts with models that add lagged five-match team form. Model validation trains on earlier seasons and tests on the following season.
+The analysis uses the top five first divisions as its primary sample and reports the second divisions separately. It converts closing average odds to margin-adjusted probabilities, calculates log loss and Brier scores, produces calibration curves, estimates favourite and longshot gaps plus logistic calibration slopes with match-bootstrap confidence intervals, and compares odds-only forecasts with models that add lagged five-match team form. Model validation trains on earlier seasons and tests on the following season.
 
 Results are saved in `outputs/`: a Markdown report, CSV tables, and `calibration_curves.png`. The analysis will only include matches with a recognized full-time result and valid closing average odds. Python dependencies are listed in `requirements.txt`.
