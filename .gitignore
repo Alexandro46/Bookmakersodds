@@ -1,0 +1,4 @@
+data/football_data/raw/
+outputs/
+__pycache__/
+.venv/
