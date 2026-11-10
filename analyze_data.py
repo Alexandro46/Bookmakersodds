@@ -277,6 +277,46 @@ def bootstrap_bias(data: pd.DataFrame, reps: int = 3000) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+def fit_calibration_slope(prob: np.ndarray, event: np.ndarray) -> tuple[float, float]:
+    """Logistic calibration regression: event ~ intercept + slope * logit(market p)."""
+    p = np.clip(prob, 1e-6, 1 - 1e-6)
+    x = np.column_stack([np.ones(len(p)), np.log(p / (1 - p))])
+    beta = np.array([0.0, 1.0])
+    for _ in range(40):
+        fitted = 1 / (1 + np.exp(-np.clip(x @ beta, -30, 30)))
+        weight = fitted * (1 - fitted)
+        information = x.T @ (weight[:, None] * x) + np.eye(2) * 1e-9
+        step = np.linalg.solve(information, x.T @ (event - fitted))
+        beta += step
+        if np.max(np.abs(step)) < 1e-8:
+            break
+    return float(beta[0]), float(beta[1])
+
+
+def calibration_slope_regression(data: pd.DataFrame, reps: int = 500) -> pd.DataFrame:
+    """Estimate market calibration slope and bootstrap by whole match clusters."""
+    rng = np.random.default_rng(8086)
+    groups = list(data.groupby(["tier", "league"], sort=True))
+    groups += [(('top', 'All top divisions'), data[data.tier == "top"]),
+               (('second', 'All second divisions'), data[data.tier == "second"])]
+    records = []
+    for keys, g in groups:
+        if len(g) < 2:
+            continue
+        prob = g[["pH", "pD", "pA"]].to_numpy()
+        actual = np.eye(3)[[OUTCOMES.index(v) for v in g.result]]
+        alpha, slope = fit_calibration_slope(prob.ravel(), actual.ravel())
+        boot = np.empty(reps)
+        for rep in range(reps):
+            sample = rng.integers(0, len(g), len(g))
+            boot[rep] = fit_calibration_slope(prob[sample].ravel(), actual[sample].ravel())[1]
+        records.append({"tier": keys[0], "league": keys[1], "matches": len(g),
+                        "intercept": alpha, "calibration_slope": slope,
+                        "slope_ci95_low": np.quantile(boot, .025),
+                        "slope_ci95_high": np.quantile(boot, .975)})
+    return pd.DataFrame(records)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", type=Path, default=Path("data/football_data/raw"))
@@ -294,6 +334,8 @@ def main() -> None:
     bins.to_csv(args.output_dir / "reliability_bins_by_league.csv", index=False)
     bias = bootstrap_bias(data)
     bias.to_csv(args.output_dir / "favorite_longshot_bias.csv", index=False)
+    slope_results = calibration_slope_regression(data)
+    slope_results.to_csv(args.output_dir / "calibration_slope_regression.csv", index=False)
     models = run_model_comparison(data)
     models.to_csv(args.output_dir / "time_ordered_model_comparison.csv", index=False)
     save_reliability_plot(bins, args.output_dir / "calibration_curves.png")
@@ -303,6 +345,7 @@ def main() -> None:
     total_top = int(top.matches.sum())
     total_second = int(second.matches.sum())
     pooled_top_bias = bias[bias.league == "All top divisions"].iloc[0]
+    pooled_top_slope = slope_results[slope_results.league == "All top divisions"].iloc[0]
     model_means = models.groupby("model")[["log_loss", "brier_sum"]].mean()
     best_model = model_means.loc[model_means.log_loss.idxmin()]
     raw_model = model_means.loc["Bookmaker odds (market)"]
@@ -314,8 +357,9 @@ def main() -> None:
         "## Initial findings\n",
         f"Across the {total_top:,} top-division matches, the weighted market log loss is {summarize_group(data[data.tier == 'top'])['market_log_loss']:.3f} and the multiclass Brier score is {summarize_group(data[data.tier == 'top'])['market_brier_sum']:.3f}. For the {total_second:,} second-division matches, these are {summarize_group(data[data.tier == 'second'])['market_log_loss']:.3f} and {summarize_group(data[data.tier == 'second'])['market_brier_sum']:.3f}. The lower top-tier scores indicate better probability accuracy in this sample.\n",
         f"Pooled top-tier favourites win {pooled_top_bias.favorite_gap_pp:.2f} percentage points more often than implied by the margin-adjusted market probabilities (match-bootstrap 95% interval {pooled_top_bias.favorite_ci95_low_pp:.2f} to {pooled_top_bias.favorite_ci95_high_pp:.2f}). The longshot gap is {pooled_top_bias.longshot_gap_pp:.2f} points (95% interval {pooled_top_bias.longshot_ci95_low_pp:.2f} to {pooled_top_bias.longshot_ci95_high_pp:.2f}). This is preliminary evidence consistent with a favourite–longshot pattern among favourites, while the pooled longshot estimate remains uncertain; it is not proof of a uniform effect across leagues.\n",
+        f"The pooled top-tier calibration regression estimates a slope of {pooled_top_slope.calibration_slope:.3f} (match-bootstrap 95% interval {pooled_top_slope.slope_ci95_low:.3f} to {pooled_top_slope.slope_ci95_high:.3f}). A slope above 1 means observed outcome probabilities are more extreme than the market implies, consistent with favourite–longshot bias; inspect the interval and league-level estimates before drawing conclusions.\n",
         "Across the five top divisions, La Liga has the largest favourite win-rate gap in this sample; league-specific estimates and intervals are in favorite_longshot_bias.csv. Treat league-by-league intervals as exploratory because several comparisons are made.\n",
-        f"Across the four time-ordered test seasons, {model_means.log_loss.idxmin()} has the lowest mean log loss ({best_model.log_loss:.3f}); raw bookmaker odds average {raw_model.log_loss:.3f}. Compare per-season results in time_ordered_model_comparison.csv.\n",
+        f"Across the four time-ordered test seasons, {model_means.log_loss.idxmin()} has the lowest mean log loss ({best_model.log_loss:.3f}); raw bookmaker odds average {raw_model.log_loss:.3f}. Adding form did not improve the mean score in these folds: logistic odds plus form {model_means.loc['Logistic odds plus form', 'log_loss']:.3f}, decision tree {model_means.loc['Decision tree odds plus form', 'log_loss']:.3f}, and boosting {model_means.loc['Boosting odds plus form', 'log_loss']:.3f}. These small differences are descriptive; no paired significance test was run. See time_ordered_model_comparison.csv for per-season results.\n",
         "## Reading the results\n",
         "A positive favourite gap means favourites won more often than their odds implied; a negative longshot gap means the least likely outcomes occurred less often than implied. That pattern is consistent with favourite–longshot bias. It is descriptive evidence: the simple favourite/longshot comparison does not establish why the pricing pattern occurs. Check whether each 95% interval excludes zero before treating a gap as distinguishable from sampling variation.\n",
         "Calibration metrics and gaps are reported by league and season in the CSV files. Reliability bins compare observed frequencies with implied probabilities by outcome and probability range. Lower log loss and Brier score indicate better probabilistic forecasts.\n",
@@ -326,7 +370,7 @@ def main() -> None:
         "## Output files\n",
         "- calibration_by_league.csv and calibration_by_league_season.csv: overall and seasonal probability metrics.\n",
         "- reliability_bins_by_league.csv and calibration_curves.png: decile calibration data and a top-tier reliability plot.\n",
-        "- favorite_longshot_bias.csv: favourite and longshot gaps with match-bootstrap 95% intervals.\n",
+        "- favorite_longshot_bias.csv and calibration_slope_regression.csv: favourite/longshot gaps and calibration-slope regressions, with match-bootstrap 95% intervals.\n",
         "- time_ordered_model_comparison.csv: out-of-sample metrics by test season and model.\n",
         "- data_quality_by_season.csv: input coverage and exclusions.\n",
     ]
