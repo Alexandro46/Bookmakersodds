@@ -13,6 +13,8 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.compose import ColumnTransformer
 
 SEASONS = ["1920", "2021", "2122", "2223", "2324", "2425"]
 LEAGUES = {
@@ -66,6 +68,9 @@ def load_matches(input_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
                 "oh": odds.loc[keep, "AvgCH"].astype(float),
                 "od": odds.loc[keep, "AvgCD"].astype(float),
                 "oa": odds.loc[keep, "AvgCA"].astype(float),
+                **{col: pd.to_numeric(df.loc[keep, col], errors="coerce") if col in df.columns
+                   else np.nan for col in ["FTHG", "FTAG", "HST", "HS", "HC", "HY", "HR",
+                                           "AST", "AS", "AC", "AY", "AR"]},
                 "season": season_label(season), "season_code": season,
                 "code": code, "country": country, "league": league_name, "tier": tier,
             })
@@ -75,11 +80,48 @@ def load_matches(input_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     inv = 1 / data[["oh", "od", "oa"]].to_numpy()
     data[["pH", "pD", "pA"]] = inv / inv.sum(axis=1, keepdims=True)
     data["overround"] = inv.sum(axis=1) - 1
+    data[["pH_add", "pD_add", "pA_add"]] = additive_probabilities(inv)
+    power = np.array([power_probabilities(row) for row in inv])
+    shin = np.array([shin_probabilities(row) for row in inv])
+    data[["pH_power", "pD_power", "pA_power"]] = power
+    data[["pH_shin", "pD_shin", "pA_shin"]] = shin
     return data, pd.DataFrame(audit)
 
 
-def summarize_group(g: pd.DataFrame) -> dict:
-    p = g[["pH", "pD", "pA"]].to_numpy()
+def additive_probabilities(q: np.ndarray) -> np.ndarray:
+    return q - (q.sum(axis=1, keepdims=True) - 1.0) / q.shape[1]
+
+
+def power_probabilities(q: np.ndarray) -> np.ndarray:
+    from scipy.optimize import brentq
+    exponent = brentq(lambda b: np.power(q, b).sum() - 1.0, 0.01, 50.0)
+    p = np.power(q, exponent)
+    return p / p.sum()
+
+
+def shin_probabilities(q: np.ndarray) -> np.ndarray:
+    from scipy.optimize import brentq
+    total = q.sum()
+    if total <= 1.0:
+        return q / total
+    def probs(z: float) -> np.ndarray:
+        radicand = np.maximum(z * z + 4 * (1 - z) * np.square(q) / total, 0)
+        return 2 * np.square(q) / (total * (np.sqrt(radicand) + z))
+    z = brentq(lambda value: probs(value).sum() - 1.0, 0.0, 1.0)
+    p = probs(z)
+    return p / p.sum()
+
+
+PROBABILITY_COLUMNS = {
+    "proportional": ["pH", "pD", "pA"],
+    "additive": ["pH_add", "pD_add", "pA_add"],
+    "power": ["pH_power", "pD_power", "pA_power"],
+    "shin": ["pH_shin", "pD_shin", "pA_shin"],
+}
+
+
+def summarize_group(g: pd.DataFrame, pcols: list[str] | None = None) -> dict:
+    p = g[pcols or PROBABILITY_COLUMNS["proportional"]].to_numpy()
     y = g["result"].to_numpy()
     y_idx = np.array([OUTCOMES.index(v) for v in y])
     actual = np.eye(3)[y_idx]
@@ -100,12 +142,12 @@ def summarize_group(g: pd.DataFrame) -> dict:
     }
 
 
-def grouped_metrics(data: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
+def grouped_metrics(data: pd.DataFrame, keys: list[str], pcols: list[str] | None = None) -> pd.DataFrame:
     records = []
     for group_key, g in data.groupby(keys, sort=True):
         if not isinstance(group_key, tuple):
             group_key = (group_key,)
-        records.append({**dict(zip(keys, group_key)), **summarize_group(g)})
+        records.append({**dict(zip(keys, group_key)), **summarize_group(g, pcols)})
     return pd.DataFrame(records)
 
 
@@ -133,36 +175,80 @@ def calibration_bins(data: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
 def add_pre_match_form(data: pd.DataFrame) -> pd.DataFrame:
     """Build last-five-match team form using only fixtures on earlier dates."""
     form_cols = ["home_points5", "away_points5", "home_gd5", "away_gd5",
-                 "home_winrate5", "away_winrate5", "form_points_diff", "form_gd_diff"]
+                 "home_winrate5", "away_winrate5", "form_points_diff", "form_gd_diff",
+                 "home_gf5", "away_gf5", "home_ga5", "away_ga5",
+                 "home_sot5", "away_sot5", "home_shots5", "away_shots5",
+                 "home_corners5", "away_corners5", "home_cards5", "away_cards5",
+                 "home_rest_days", "away_rest_days", "home_season_ppg", "away_season_ppg",
+                 "home_season_gdpg", "away_season_gdpg", "home_h2h_points5", "away_h2h_points5"]
     result = data.sort_values(["date", "code", "home", "away"]).copy().reset_index(drop=True)
     for col in form_cols:
         result[col] = np.nan
     # Form histories are isolated by competition and team; update only after each date.
-    histories: dict[tuple[str, str], list[tuple[float, float, float]]] = {}
+    histories: dict[tuple[str, str], list[dict[str, float]]] = {}
+    season_histories: dict[tuple[str, str, str], list[dict[str, float]]] = {}
+    h2h: dict[tuple[str, str, str], list[float]] = {}
+    last_played: dict[tuple[str, str], pd.Timestamp] = {}
     for (code, date), idxs in result.groupby(["code", "date"], sort=True).groups.items():
         additions: list[tuple[tuple[str, str], tuple[float, float, float]]] = []
         for idx in idxs:
             row = result.loc[idx]
             home_hist = histories.get((code, row.home), [])[-5:]
             away_hist = histories.get((code, row.away), [])[-5:]
-            def means(hist: list[tuple[float, float, float]]) -> tuple[float, float, float]:
+            def means(hist: list[dict[str, float]]) -> tuple[float, float, float]:
                 if not hist:
                     return (np.nan, np.nan, np.nan)
-                arr = np.array(hist, dtype=float)
-                return float(arr[:, 0].mean()), float(arr[:, 1].mean()), float(arr[:, 2].mean())
+                return tuple(float(np.mean([o[key] for o in hist])) for key in ("points", "gd", "win"))
             hp, hgd, hwr = means(home_hist)
             ap, agd, awr = means(away_hist)
-            result.loc[idx, form_cols] = [hp, ap, hgd, agd, hwr, awr,
-                                         hp - ap if np.isfinite(hp) and np.isfinite(ap) else np.nan,
-                                         hgd - agd if np.isfinite(hgd) and np.isfinite(agd) else np.nan]
+            def mean_stat(hist: list[dict[str, float]], key: str) -> float:
+                available = [o[key] for o in hist if np.isfinite(o[key])]
+                return float(np.mean(available)) if available else np.nan
+            h2h_hist = h2h.get((code, row.home, row.away), [])[-5:]
+            h2h_away_hist = h2h.get((code, row.away, row.home), [])[-5:]
+            hseason = season_histories.get((code, row.season, row.home), [])
+            aseason = season_histories.get((code, row.season, row.away), [])
+            hdate, adate = last_played.get((code, row.home)), last_played.get((code, row.away))
+            hrest = (date - hdate).days if hdate is not None else np.nan
+            arest = (date - adate).days if adate is not None else np.nan
+            result.loc[idx, form_cols] = [
+                hp, ap, hgd, agd, hwr, awr,
+                hp - ap if np.isfinite(hp) and np.isfinite(ap) else np.nan,
+                hgd - agd if np.isfinite(hgd) and np.isfinite(agd) else np.nan,
+                mean_stat(home_hist, "gf"), mean_stat(away_hist, "gf"),
+                mean_stat(home_hist, "ga"), mean_stat(away_hist, "ga"),
+                mean_stat(home_hist, "sot"), mean_stat(away_hist, "sot"),
+                mean_stat(home_hist, "shots"), mean_stat(away_hist, "shots"),
+                mean_stat(home_hist, "corners"), mean_stat(away_hist, "corners"),
+                mean_stat(home_hist, "cards"), mean_stat(away_hist, "cards"), hrest, arest,
+                float(np.mean([o["points"] for o in hseason])) if hseason else np.nan,
+                float(np.mean([o["points"] for o in aseason])) if aseason else np.nan,
+                float(np.mean([o["gd"] for o in hseason])) if hseason else np.nan,
+                float(np.mean([o["gd"] for o in aseason])) if aseason else np.nan,
+                float(np.mean(h2h_hist)) if h2h_hist else np.nan,
+                float(np.mean(h2h_away_hist)) if h2h_away_hist else np.nan,
+            ]
             outcome = row.result
             hg, ag = (3.0, 0.0) if outcome == "H" else ((0.0, 3.0) if outcome == "A" else (1.0, 1.0))
+            def numeric_stat(col: str, default=np.nan) -> float:
+                return float(row[col]) if col in row.index and pd.notna(row[col]) else default
             additions.extend([
-                ((code, row.home), (hg, float(hg - ag), float(outcome == "H"))),
-                ((code, row.away), (ag, float(ag - hg), float(outcome == "A"))),
+                ((code, row.home), {"points": hg, "gd": float(hg - ag), "win": float(outcome == "H"),
+                                    "gf": float(row.FTHG), "ga": float(row.FTAG),
+                                    "sot": numeric_stat("HST"), "shots": numeric_stat("HS"),
+                                    "corners": numeric_stat("HC"), "cards": numeric_stat("HY") + numeric_stat("HR", 0)}),
+                ((code, row.away), {"points": ag, "gd": float(ag - hg), "win": float(outcome == "A"),
+                                    "gf": float(row.FTAG), "ga": float(row.FTHG),
+                                    "sot": numeric_stat("AST"), "shots": numeric_stat("AS"),
+                                    "corners": numeric_stat("AC"), "cards": numeric_stat("AY") + numeric_stat("AR", 0)}),
             ])
+            h2h.setdefault((code, row.home, row.away), []).append(hg)
+            h2h.setdefault((code, row.away, row.home), []).append(ag)
+            last_played[(code, row.home)] = date
+            last_played[(code, row.away)] = date
         for key, observation in additions:
             histories.setdefault(key, []).append(observation)
+            season_histories.setdefault((key[0], row.season, key[1]), []).append(observation)
     result["odds_logit_HD"] = np.log(result.pH / result.pA)
     result["odds_logit_DA"] = np.log(result.pD / result.pA)
     return result
@@ -174,6 +260,12 @@ def run_model_comparison(data: pd.DataFrame) -> pd.DataFrame:
     odds_features = ["odds_logit_HD", "odds_logit_DA"]
     form_features = ["home_points5", "away_points5", "home_gd5", "away_gd5",
                      "home_winrate5", "away_winrate5", "form_points_diff", "form_gd_diff"]
+    extended_features = form_features + [
+        "home_gf5", "away_gf5", "home_ga5", "away_ga5", "home_sot5", "away_sot5",
+        "home_shots5", "away_shots5", "home_corners5", "away_corners5", "home_cards5",
+        "away_cards5", "home_rest_days", "away_rest_days", "home_season_ppg", "away_season_ppg",
+        "home_season_gdpg", "away_season_gdpg", "home_h2h_points5", "away_h2h_points5",
+    ]
     records = []
     seasons = [season_label(s) for s in SEASONS]
     models = {
@@ -181,14 +273,20 @@ def run_model_comparison(data: pd.DataFrame) -> pd.DataFrame:
                                                        LogisticRegression(max_iter=1500)), odds_features),
         "Logistic odds plus form": (make_pipeline(SimpleImputer(strategy="median"),
                                                    LogisticRegression(max_iter=1500)), odds_features + form_features),
-        "Decision tree odds plus form": (make_pipeline(SimpleImputer(strategy="median"),
-                                                        DecisionTreeClassifier(max_depth=4, min_samples_leaf=50,
-                                                                               random_state=2026)), odds_features + form_features),
+        "Logistic odds plus extended features": (make_pipeline(SimpleImputer(strategy="median"),
+                                                                 LogisticRegression(max_iter=1500)), odds_features + extended_features),
+        "Logistic extended plus team identity": (make_pipeline(
+            ColumnTransformer([("numeric", SimpleImputer(strategy="median"), odds_features + extended_features),
+                               ("teams", OneHotEncoder(handle_unknown="ignore"), ["home", "away"])]),
+            LogisticRegression(max_iter=2000)), odds_features + extended_features + ["home", "away"]),
+        "Decision tree odds plus extended": (make_pipeline(SimpleImputer(strategy="median"),
+                                                            DecisionTreeClassifier(max_depth=4, min_samples_leaf=50,
+                                                                                   random_state=2026)), odds_features + extended_features),
         "Boosting odds plus form": (make_pipeline(SimpleImputer(strategy="median"),
                                                    HistGradientBoostingClassifier(max_iter=120, learning_rate=0.06,
                                                                                   max_leaf_nodes=15,
                                                                                   l2_regularization=2.0,
-                                                                                  random_state=2026)), odds_features + form_features),
+                                                                                  random_state=2026)), odds_features + extended_features),
     }
     for test_i in range(2, len(seasons)):
         train = top[top.season.isin(seasons[:test_i])]
@@ -310,10 +408,53 @@ def calibration_slope_regression(data: pd.DataFrame, reps: int = 500) -> pd.Data
         for rep in range(reps):
             sample = rng.integers(0, len(g), len(g))
             boot[rep] = fit_calibration_slope(prob[sample].ravel(), actual[sample].ravel())[1]
+        # Center the bootstrap distribution at H0 (slope=1) before computing a two-sided p-value.
+        null_boot = boot - slope + 1.0
+        p_raw = (1 + np.sum(np.abs(null_boot - 1.0) >= abs(slope - 1.0))) / (reps + 1)
         records.append({"tier": keys[0], "league": keys[1], "matches": len(g),
                         "intercept": alpha, "calibration_slope": slope,
                         "slope_ci95_low": np.quantile(boot, .025),
-                        "slope_ci95_high": np.quantile(boot, .975)})
+                        "slope_ci95_high": np.quantile(boot, .975), "p_unadjusted": p_raw})
+    result = pd.DataFrame(records)
+    result["p_holm_within_tier"] = np.nan
+    for tier in ("top", "second"):
+        mask = (result.tier == tier) & ~result.league.str.startswith("All ")
+        indices = result.index[mask]
+        ordered = result.loc[indices, "p_unadjusted"].sort_values()
+        m = len(ordered)
+        adjusted = np.maximum.accumulate([(m - rank) * p for rank, p in enumerate(ordered, start=1)])
+        adjusted = np.minimum(adjusted, 1.0)
+        result.loc[ordered.index, "p_holm_within_tier"] = adjusted
+    return result
+
+
+def margin_method_comparison(data: pd.DataFrame) -> pd.DataFrame:
+    records = []
+    for method, pcols in PROBABILITY_COLUMNS.items():
+        for (tier, country, league), g in data.groupby(["tier", "country", "league"], sort=True):
+            records.append({"margin_method": method, "tier": tier, "country": country,
+                            "league": league, **summarize_group(g, pcols)})
+        for tier, g in data.groupby("tier", sort=True):
+            p = g[pcols].to_numpy()
+            actual = np.eye(3)[[OUTCOMES.index(v) for v in g.result]]
+            alpha, slope = fit_calibration_slope(p.ravel(), actual.ravel())
+            rng = np.random.default_rng(4400 + len(method) + len(tier))
+            boot = np.empty(500)
+            for rep in range(len(boot)):
+                sample = rng.integers(0, len(g), len(g))
+                boot[rep] = fit_calibration_slope(p[sample].ravel(), actual[sample].ravel())[1]
+            p_raw = (1 + np.sum(np.abs(boot - slope) >= abs(slope - 1.0))) / (len(boot) + 1)
+            rows = np.arange(len(g))
+            fav, long = p.argmax(axis=1), p.argmin(axis=1)
+            records.append({"margin_method": method, "tier": tier, "country": "All",
+                            "league": "All divisions in tier", "matches": len(g),
+                            "market_log_loss": float(-np.log(np.clip(p[rows, [OUTCOMES.index(v) for v in g.result]], 1e-15, 1)).mean()),
+                            "market_brier_sum": np.square(actual - p).sum(axis=1).mean(),
+                            "favorite_actual_minus_expected_pp": 100 * (actual[rows, fav] - p[rows, fav]).mean(),
+                            "longshot_actual_minus_expected_pp": 100 * (actual[rows, long] - p[rows, long]).mean(),
+                            "calibration_slope": slope, "calibration_intercept": alpha,
+                            "slope_ci95_low": np.quantile(boot, .025),
+                            "slope_ci95_high": np.quantile(boot, .975), "slope_p_unadjusted": p_raw})
     return pd.DataFrame(records)
 
 
@@ -336,6 +477,8 @@ def main() -> None:
     bias.to_csv(args.output_dir / "favorite_longshot_bias.csv", index=False)
     slope_results = calibration_slope_regression(data)
     slope_results.to_csv(args.output_dir / "calibration_slope_regression.csv", index=False)
+    margin_results = margin_method_comparison(data)
+    margin_results.to_csv(args.output_dir / "margin_method_comparison.csv", index=False)
     models = run_model_comparison(data)
     models.to_csv(args.output_dir / "time_ordered_model_comparison.csv", index=False)
     save_reliability_plot(bins, args.output_dir / "calibration_curves.png")
@@ -349,28 +492,36 @@ def main() -> None:
     model_means = models.groupby("model")[["log_loss", "brier_sum"]].mean()
     best_model = model_means.loc[model_means.log_loss.idxmin()]
     raw_model = model_means.loc["Bookmaker odds (market)"]
+    pooled_margin = margin_results[(margin_results.tier == "top") &
+                                   (margin_results.league == "All divisions in tier")]
+    method_slope_range = (pooled_margin.calibration_slope.min(), pooled_margin.calibration_slope.max())
+    method_ll_range = (pooled_margin.market_log_loss.min(), pooled_margin.market_log_loss.max())
     report = [
         "# Football betting odds analysis\n",
         "## Scope and method\n",
         f"The analysis includes {total_top:,} top-division matches and {total_second:,} second-division matches with a full-time result and valid closing average odds. It covers 2019/20–2024/25 for England, Germany, Italy, Spain and France. The first divisions are the proposal's primary sample; second divisions are reported separately.\n",
-        "For each match, inverse closing average odds (AvgCH, AvgCD, AvgCA) were normalized to sum to one. This proportional normalization removes the bookmaker overround. Log loss and multiclass Brier score assess probability accuracy. Favourite and longshot gaps compare the realized result rate with the normalized market probability for the most and least likely outcomes in each match. Confidence intervals use a match-level bootstrap.\n",
+        "For each match, inverse closing average odds (AvgCH, AvgCD, AvgCA) were converted to probabilities using proportional, additive, power and Shin margin-removal methods. Log loss and multiclass Brier score assess probability accuracy. Favourite and longshot gaps compare the realized result rate with the adjusted market probability for the most and least likely outcomes in each match. Confidence intervals use a match-level bootstrap.\n",
         "## Initial findings\n",
         f"Across the {total_top:,} top-division matches, the weighted market log loss is {summarize_group(data[data.tier == 'top'])['market_log_loss']:.3f} and the multiclass Brier score is {summarize_group(data[data.tier == 'top'])['market_brier_sum']:.3f}. For the {total_second:,} second-division matches, these are {summarize_group(data[data.tier == 'second'])['market_log_loss']:.3f} and {summarize_group(data[data.tier == 'second'])['market_brier_sum']:.3f}. The lower top-tier scores indicate better probability accuracy in this sample.\n",
         f"Pooled top-tier favourites win {pooled_top_bias.favorite_gap_pp:.2f} percentage points more often than implied by the margin-adjusted market probabilities (match-bootstrap 95% interval {pooled_top_bias.favorite_ci95_low_pp:.2f} to {pooled_top_bias.favorite_ci95_high_pp:.2f}). The longshot gap is {pooled_top_bias.longshot_gap_pp:.2f} points (95% interval {pooled_top_bias.longshot_ci95_low_pp:.2f} to {pooled_top_bias.longshot_ci95_high_pp:.2f}). This is preliminary evidence consistent with a favourite–longshot pattern among favourites, while the pooled longshot estimate remains uncertain; it is not proof of a uniform effect across leagues.\n",
         f"The pooled top-tier calibration regression estimates a slope of {pooled_top_slope.calibration_slope:.3f} (match-bootstrap 95% interval {pooled_top_slope.slope_ci95_low:.3f} to {pooled_top_slope.slope_ci95_high:.3f}). A slope above 1 means observed outcome probabilities are more extreme than the market implies, consistent with favourite–longshot bias; inspect the interval and league-level estimates before drawing conclusions.\n",
-        "Across the five top divisions, La Liga has the largest favourite win-rate gap in this sample; league-specific estimates and intervals are in favorite_longshot_bias.csv. Treat league-by-league intervals as exploratory because several comparisons are made.\n",
-        f"Across the four time-ordered test seasons, {model_means.log_loss.idxmin()} has the lowest mean log loss ({best_model.log_loss:.3f}); raw bookmaker odds average {raw_model.log_loss:.3f}. Adding form did not improve the mean score in these folds: logistic odds plus form {model_means.loc['Logistic odds plus form', 'log_loss']:.3f}, decision tree {model_means.loc['Decision tree odds plus form', 'log_loss']:.3f}, and boosting {model_means.loc['Boosting odds plus form', 'log_loss']:.3f}. These small differences are descriptive; no paired significance test was run. See time_ordered_model_comparison.csv for per-season results.\n",
+        "## Robustness checks\n",
+        f"For the top divisions, the four margin-removal methods produce log loss between {method_ll_range[0]:.3f} and {method_ll_range[1]:.3f}, but calibration slopes range from {method_slope_range[0]:.3f} to {method_slope_range[1]:.3f}. Probability accuracy scores barely change, while the strength of the favourite–longshot calibration signal does. This means the evidence about bias is sensitive to how the bookmaker margin is allocated; see margin_method_comparison.csv for each league and method.\n",
+        "League-level calibration-slope tests use match-bootstrap p-values and Holm correction across the five leagues separately within each tier. Adjusted values appear in calibration_slope_regression.csv; use the adjusted p-values, rather than the unadjusted intervals, for league-by-league significance claims.\n",
+        "La Liga and Serie A have the largest top-tier slope estimates, but after Holm adjustment no individual league has a p-value below .05. The pooled estimate should guide interpretation more than an isolated league result; adjusted p-values are in calibration_slope_regression.csv.\n",
+        f"Across the four time-ordered test seasons, {model_means.log_loss.idxmin()} has the lowest mean log loss ({best_model.log_loss:.3f}); raw bookmaker odds average {raw_model.log_loss:.3f}. Additional features were: logistic odds plus basic form {model_means.loc['Logistic odds plus form', 'log_loss']:.3f}; logistic plus extended match-history features {model_means.loc['Logistic odds plus extended features', 'log_loss']:.3f}; extended features plus team identities {model_means.loc['Logistic extended plus team identity', 'log_loss']:.3f}; decision tree {model_means.loc['Decision tree odds plus extended', 'log_loss']:.3f}; boosting {model_means.loc['Boosting odds plus form', 'log_loss']:.3f}. These small differences are descriptive; no paired significance test was run. See time_ordered_model_comparison.csv for per-season results.\n",
         "## Reading the results\n",
         "A positive favourite gap means favourites won more often than their odds implied; a negative longshot gap means the least likely outcomes occurred less often than implied. That pattern is consistent with favourite–longshot bias. It is descriptive evidence: the simple favourite/longshot comparison does not establish why the pricing pattern occurs. Check whether each 95% interval excludes zero before treating a gap as distinguishable from sampling variation.\n",
         "Calibration metrics and gaps are reported by league and season in the CSV files. Reliability bins compare observed frequencies with implied probabilities by outcome and probability range. Lower log loss and Brier score indicate better probabilistic forecasts.\n",
         "## Predictive model comparison\n",
-        "The expanding-window comparison uses only top-division matches. It trains on earlier full seasons and tests on the next season. Historical form uses each team's previous five matches, excludes the current match date, and is constructed separately within each competition. It compares the raw bookmaker probabilities with logistic recalibration and with logistic regression, a decision tree and histogram gradient boosting that add historical form. Lower out-of-sample log loss/Brier score is better. These are initial models, not an exhaustive hyperparameter search.\n",
+        "The expanding-window comparison uses only top-division matches. It trains on earlier full seasons and tests on the next season. Historical performance features use only earlier match dates: recent points, goals, shots on target, shots, corners, cards, season-to-date points and goal difference, days since the previous match, and prior head-to-head points. Team identity is included as one-hot features in one logistic model. The comparison includes raw odds, odds recalibration, logistic regression, a decision tree and histogram gradient boosting. Lower out-of-sample log loss/Brier score is better. These are initial models, not an exhaustive feature search.\n",
         "## Data checks and limitations\n",
         "See data_quality_by_season.csv for source row counts, valid results, usable closing odds and duplicate fixture checks. Raw downloads are preserved in data/football_data/raw. CSV column availability is checked before analysis; observations without valid closing average odds or a recognized result are excluded. The analysis should be treated as provisional until team names, duplicate fixtures, season changes and league-specific missingness have been reviewed.\n",
         "## Output files\n",
         "- calibration_by_league.csv and calibration_by_league_season.csv: overall and seasonal probability metrics.\n",
         "- reliability_bins_by_league.csv and calibration_curves.png: decile calibration data and a top-tier reliability plot.\n",
         "- favorite_longshot_bias.csv and calibration_slope_regression.csv: favourite/longshot gaps and calibration-slope regressions, with match-bootstrap 95% intervals.\n",
+        "- margin_method_comparison.csv: sensitivity of calibration and favourite/longshot findings to alternative margin-removal methods.\n",
         "- time_ordered_model_comparison.csv: out-of-sample metrics by test season and model.\n",
         "- data_quality_by_season.csv: input coverage and exclusions.\n",
     ]
@@ -388,4 +539,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
