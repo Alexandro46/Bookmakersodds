@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""Robustness add-on for analyze_data.py.
+
+Addresses five review points:
+  1. Direct first- vs second-division comparison (difference in slope / favourite gap).
+  2. Block bootstrap (league-season and season blocks) next to the match bootstrap,
+     with all four margin-removal methods.
+  3. Explicit primary vs exploratory tests, Holm-adjusted within the primary family.
+  4. Paired model-vs-bookmaker log-loss differences on identical held-out matches,
+     per season, with week-block bootstrap intervals.
+  5. A data-pipeline audit (sequential drop counts) and team-form histories built
+     from ALL played matches, not only matches with valid closing odds.
+
+Usage:  python robust_analysis.py --input-dir data/football_data/raw --output-dir outputs
+        (add --reps 200 for a quick test run)
+"""
+from __future__ import annotations
+
+import argparse
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import brentq
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.tree import DecisionTreeClassifier
+
+import analyze_data as ad
+
+METHODS = ["proportional", "additive", "power", "shin"]
+SCHEMES = ["match", "league_season", "season"]
+FORM_COLS = ["home_points5", "away_points5", "home_gd5", "away_gd5",
+             "home_winrate5", "away_winrate5", "form_points_diff", "form_gd_diff"]
+KEY = ["code", "date", "home", "away"]
+
+
+# --------------------------------------------------------------------------- #
+# Margin removal
+# --------------------------------------------------------------------------- #
+def remove_margin(odds: np.ndarray, method: str) -> np.ndarray:
+    """odds: (n, 3) decimal odds -> (n, 3) probabilities summing to 1."""
+    inv = 1.0 / odds
+    book = inv.sum(axis=1, keepdims=True)
+    if method == "proportional":
+        return inv / book
+    if method == "additive":
+        p = np.clip(inv - (book - 1) / 3, 1e-6, None)
+        return p / p.sum(axis=1, keepdims=True)
+    if method not in ("power", "shin"):
+        raise ValueError(f"unknown margin method: {method}")
+    out = inv / book  # fallback for rows where the solver does not apply
+    for i, r in enumerate(inv):
+        b = book[i, 0]
+        if b <= 1 + 1e-12:
+            continue
+        try:
+            if method == "power":
+                k = brentq(lambda k: (r ** k).sum() - 1, 1.0, 50.0)
+                out[i] = r ** k
+            else:
+                def f(z):
+                    q = (np.sqrt(z ** 2 + 4 * (1 - z) * r ** 2 / b) - z) / (2 * (1 - z))
+                    return q.sum() - 1
+                z = brentq(f, 1e-9, 0.9)
+                q = (np.sqrt(z ** 2 + 4 * (1 - z) * r ** 2 / b) - z) / (2 * (1 - z))
+                out[i] = q / q.sum()
+        except ValueError:
+            pass  # solver failed to bracket: keep proportional for this row
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Loading + pipeline audit (point 5)
+# --------------------------------------------------------------------------- #
+def load_all(input_dir: Path) -> pd.DataFrame:
+    """Every raw row, with one boolean flag per exclusion reason."""
+    frames = []
+    for season in ad.SEASONS:
+        for code, (country, league, tier) in ad.LEAGUES.items():
+            df = pd.read_csv(input_dir / season / f"{code}.csv", encoding="latin1", low_memory=False)
+            odds = df[ad.ODDS].apply(pd.to_numeric, errors="coerce")
+            part = pd.DataFrame({
+                "date": pd.to_datetime(df["Date"], dayfirst=True, errors="coerce"),
+                "home": df["HomeTeam"].astype("string"), "away": df["AwayTeam"].astype("string"),
+                "result": df["FTR"].astype("string"),
+                "oh": odds["AvgCH"], "od": odds["AvgCD"], "oa": odds["AvgCA"],
+                "season": ad.season_label(season), "code": code,
+                "country": country, "league": league, "tier": tier,
+            })
+            part["has_teams"] = part[["home", "away"]].notna().all(axis=1)
+            part["has_result"] = part["result"].isin(ad.OUTCOMES)
+            part["has_date"] = part["date"].notna()
+            base = part.has_teams & part.has_result & part.has_date
+            dup = pd.Series(False, index=part.index)
+            dup[base] = part[base].duplicated(["code", "season", "date", "home", "away"], keep="first")
+            part["is_duplicate"] = dup
+            part["has_odds"] = part[["oh", "od", "oa"]].notna().all(axis=1) & (part[["oh", "od", "oa"]] > 1).all(axis=1)
+            part["played"] = base & ~part.is_duplicate        # usable for team form
+            part["keep"] = part.played & part.has_odds         # usable for odds analysis
+            frames.append(part)
+    return pd.concat(frames, ignore_index=True)
+
+
+def pipeline_audit(raw: pd.DataFrame) -> pd.DataFrame:
+    """Sequential exclusions: each row is counted under the FIRST reason that removes it."""
+    rows = []
+    for (season, code), g in raw.groupby(["season", "code"], sort=True):
+        remaining = g
+        rec = {"season": season, "code": code, "tier": g.tier.iloc[0], "raw_rows": len(g)}
+        for label, ok in [("drop_missing_team", "has_teams"), ("drop_invalid_result", "has_result"),
+                          ("drop_bad_date", "has_date"), ("drop_duplicate_fixture", None),
+                          ("drop_missing_or_invalid_odds", "has_odds")]:
+            before = len(remaining)
+            remaining = remaining[~remaining.is_duplicate] if ok is None else remaining[remaining[ok]]
+            rec[label] = before - len(remaining)
+        rec["final_rows"] = len(remaining)
+        rows.append(rec)
+    out = pd.DataFrame(rows)
+    total = out.drop(columns=["season", "code", "tier"]).sum()
+    total["season"], total["code"], total["tier"] = "ALL", "ALL", "ALL"
+    return pd.concat([out, total.to_frame().T], ignore_index=True)
+
+
+# --------------------------------------------------------------------------- #
+# Bootstrap machinery (points 1-3)
+# --------------------------------------------------------------------------- #
+def stats(prob: np.ndarray, actual: np.ndarray) -> dict:
+    _, slope = ad.fit_calibration_slope(prob.ravel(), actual.ravel())
+    ix = np.arange(len(prob))
+    fav = prob.argmax(axis=1)
+    return {"slope": slope, "fav_gap_pp": 100 * (actual[ix, fav] - prob[ix, fav]).mean()}
+
+
+def _blocks_to_index(labels: np.ndarray) -> list[np.ndarray]:
+    ids, _ = pd.factorize(labels)
+    return [np.flatnonzero(ids == b) for b in range(ids.max() + 1)]
+
+
+def block_bootstrap(prob, actual, labels, reps, rng) -> tuple[dict, pd.DataFrame]:
+    blocks = _blocks_to_index(labels)
+    est = stats(prob, actual)
+    boots = []
+    for _ in range(reps):
+        pick = rng.integers(0, len(blocks), len(blocks))
+        ix = np.concatenate([blocks[b] for b in pick])
+        boots.append(stats(prob[ix], actual[ix]))
+    return est, pd.DataFrame(boots)
+
+
+def tier_difference_bootstrap(top, second, joint: bool, reps, rng):
+    """top/second = (prob, actual, labels). joint=True draws the SAME block labels for both tiers
+    (used for season blocks, keeps shared season shocks); otherwise blocks are drawn within tier."""
+    (pt, at, lt), (ps, as_, ls) = top, second
+    est = {k: stats(pt, at)[k] - stats(ps, as_)[k] for k in ("slope", "fav_gap_pp")}
+    boots = []
+    if joint:
+        labels = np.unique(np.concatenate([lt, ls]))
+        it = {l: np.flatnonzero(lt == l) for l in labels}
+        is_ = {l: np.flatnonzero(ls == l) for l in labels}
+    else:
+        bt, bs = _blocks_to_index(lt), _blocks_to_index(ls)
+    for _ in range(reps):
+        if joint:
+            pick = rng.choice(labels, len(labels), replace=True)
+            ixt = np.concatenate([it[l] for l in pick])
+            ixs = np.concatenate([is_[l] for l in pick])
+        else:
+            ixt = np.concatenate([bt[b] for b in rng.integers(0, len(bt), len(bt))])
+            ixs = np.concatenate([bs[b] for b in rng.integers(0, len(bs), len(bs))])
+        a, b_ = stats(pt[ixt], at[ixt]), stats(ps[ixs], as_[ixs])
+        boots.append({k: a[k] - b_[k] for k in ("slope", "fav_gap_pp")})
+    return est, pd.DataFrame(boots)
+
+
+def boot_p(boot: np.ndarray, null: float) -> float:
+    """Two-sided percentile-inversion p-value (add-one smoothed)."""
+    lo = (np.sum(boot <= null) + 1) / (len(boot) + 1)
+    hi = (np.sum(boot >= null) + 1) / (len(boot) + 1)
+    return float(min(1.0, 2 * min(lo, hi)))
+
+
+def holm(p) -> np.ndarray:
+    p = np.asarray(p, dtype=float)
+    order = np.argsort(p)
+    adj, running = np.empty(len(p)), 0.0
+    for rank, i in enumerate(order):
+        running = max(running, (len(p) - rank) * p[i])
+        adj[i] = min(1.0, running)
+    return adj
+
+
+def calibration_and_tier_tests(clean: pd.DataFrame, P: dict, reps: int, seed: int):
+    rng = np.random.default_rng(seed)
+    actual = np.eye(3)[[ad.OUTCOMES.index(v) for v in clean.result]]
+    label_fn = {"match": lambda g: np.arange(len(g)).astype(str),
+                "league_season": lambda g: (g.code + "_" + g.season).to_numpy(),
+                "season": lambda g: g.season.to_numpy()}
+    cal_rows, boots = [], {}
+    for tier in ("top", "second"):
+        m = (clean.tier == tier).to_numpy()
+        g = clean[m]
+        for method in METHODS:
+            for scheme in SCHEMES:
+                est, b = block_bootstrap(P[method][m], actual[m], label_fn[scheme](g), reps, rng)
+                boots[(tier, method, scheme)] = (est, b)
+                cal_rows.append({"tier": tier, "method": method, "scheme": scheme,
+                                 "n_blocks": len(pd.unique(label_fn[scheme](g))), "matches": int(m.sum()),
+                                 "slope": est["slope"],
+                                 "slope_ci_low": b.slope.quantile(.025), "slope_ci_high": b.slope.quantile(.975),
+                                 "fav_gap_pp": est["fav_gap_pp"],
+                                 "fav_ci_low": b.fav_gap_pp.quantile(.025), "fav_ci_high": b.fav_gap_pp.quantile(.975)})
+    cal = pd.DataFrame(cal_rows)
+
+    diff_rows = []
+    for method in METHODS:
+        for scheme in ("league_season", "season"):
+            args = []
+            for tier in ("top", "second"):
+                m = (clean.tier == tier).to_numpy()
+                args.append((P[method][m], actual[m], label_fn[scheme](clean[m])))
+            est, b = tier_difference_bootstrap(*args, joint=(scheme == "season"), reps=reps, rng=rng)
+            boots[("diff", method, scheme)] = (est, b)
+            diff_rows.append({"method": method, "scheme": scheme,
+                              "slope_diff_top_minus_second": est["slope"],
+                              "slope_diff_ci_low": b.slope.quantile(.025), "slope_diff_ci_high": b.slope.quantile(.975),
+                              "fav_gap_diff_pp": est["fav_gap_pp"],
+                              "fav_diff_ci_low": b.fav_gap_pp.quantile(.025), "fav_diff_ci_high": b.fav_gap_pp.quantile(.975)})
+    return cal, pd.DataFrame(diff_rows), boots
+
+
+def primary_vs_exploratory(boots: dict, primary_method="proportional", scheme="league_season") -> pd.DataFrame:
+    """PRIMARY FAMILY (declare before running; edit here only before looking at results):
+         P1  top-tier pooled calibration slope = 1
+         P2  top-tier pooled favourite gap = 0
+         P3  top minus second tier calibration slope = 0
+       Everything else is exploratory and reported with unadjusted p-values."""
+    rows = []
+    def add(family, label, est, b, null):
+        rows.append({"family": family, "test": label, "estimate": est, "null": null,
+                     "ci_low": np.quantile(b, .025), "ci_high": np.quantile(b, .975), "p_raw": boot_p(b.to_numpy(), null)})
+    e, b = boots[("top", primary_method, scheme)]
+    add("primary", f"P1 top slope = 1 [{primary_method}, {scheme} blocks]", e["slope"], b.slope, 1.0)
+    add("primary", f"P2 top favourite gap = 0 pp [{primary_method}, {scheme} blocks]", e["fav_gap_pp"], b.fav_gap_pp, 0.0)
+    e, b = boots[("diff", primary_method, scheme)]
+    add("primary", f"P3 tier slope difference = 0 [{primary_method}, {scheme} blocks]", e["slope"], b.slope, 0.0)
+    for (kind, method, sch), (e, b) in boots.items():
+        if sch == "match" or (method == primary_method and sch == scheme):
+            continue
+        if kind == "diff":
+            add("exploratory", f"tier slope diff = 0 [{method}, {sch}]", e["slope"], b.slope, 0.0)
+            add("exploratory", f"tier favourite-gap diff = 0 [{method}, {sch}]", e["fav_gap_pp"], b.fav_gap_pp, 0.0)
+        else:
+            add("exploratory", f"{kind} slope = 1 [{method}, {sch}]", e["slope"], b.slope, 1.0)
+            add("exploratory", f"{kind} favourite gap = 0 [{method}, {sch}]", e["fav_gap_pp"], b.fav_gap_pp, 0.0)
+    out = pd.DataFrame(rows)
+    out["p_holm_within_family"] = np.nan
+    for fam in out.family.unique():
+        sel = out.family == fam
+        out.loc[sel, "p_holm_within_family"] = holm(out.loc[sel, "p_raw"])
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Paired model tests with form built from ALL played matches (points 4 and 5)
+# --------------------------------------------------------------------------- #
+def _model_zoo():
+    imp = lambda clf: make_pipeline(SimpleImputer(strategy="median"), clf)
+    return {
+        "Logistic odds recalibration": (imp(LogisticRegression(max_iter=1500)), "odds"),
+        "Logistic odds plus form": (imp(LogisticRegression(max_iter=1500)), "odds+form"),
+        "Decision tree odds plus form": (imp(DecisionTreeClassifier(max_depth=4, min_samples_leaf=50, random_state=2026)), "odds+form"),
+        "Boosting odds plus form": (imp(HistGradientBoostingClassifier(max_iter=120, learning_rate=0.06, max_leaf_nodes=15,
+                                                                      l2_regularization=2.0, random_state=2026)), "odds+form"),
+    }
+
+
+def paired_model_tests(raw: pd.DataFrame, clean: pd.DataFrame, P_prop: np.ndarray, reps: int, seed: int):
+    rng = np.random.default_rng(seed)
+    d = clean.copy()
+    d[["pH", "pD", "pA"]] = P_prop
+    top = d[d.tier == "top"].copy()
+    # Form from every played top-tier match, odds or not, then merged onto the odds sample.
+    played = raw[(raw.tier == "top") & raw.played][KEY + ["result"]].copy()
+    played[["pH", "pD", "pA"]] = 1 / 3  # placeholders; add_pre_match_form only needs them for its last two columns
+    form = ad.add_pre_match_form(played).drop_duplicates(KEY)[KEY + FORM_COLS]
+    top = top.merge(form, on=KEY, how="left")
+    top["odds_logit_HD"] = np.log(top.pH / top.pA)
+    top["odds_logit_DA"] = np.log(top.pD / top.pA)
+    feats = {"odds": ["odds_logit_HD", "odds_logit_DA"],
+             "odds+form": ["odds_logit_HD", "odds_logit_DA"] + FORM_COLS}
+
+    seasons = [ad.season_label(s) for s in ad.SEASONS]
+    per_season, store = [], {}
+    for ti in range(2, len(seasons)):
+        train, test = top[top.season.isin(seasons[:ti])], top[top.season == seasons[ti]]
+        y_idx = np.array([ad.OUTCOMES.index(v) for v in test.result])
+        ix = np.arange(len(test))
+        market = -np.log(np.clip(test[["pH", "pD", "pA"]].to_numpy()[ix, y_idx], 1e-15, 1))
+        weeks = test.date.dt.strftime("%G-%V").to_numpy()
+        for name, (model, fset) in _model_zoo().items():
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                model.fit(train[feats[fset]], train.result)
+            pr = model.predict_proba(test[feats[fset]])
+            cls = list(model[-1].classes_)
+            pr = pr[:, [cls.index(c) for c in ad.OUTCOMES]]
+            loss = -np.log(np.clip(pr[ix, y_idx], 1e-15, 1))
+            diff = loss - market  # positive = model WORSE than bookmaker on the same matches
+            blocks = _blocks_to_index(weeks)
+            sums = np.array([diff[b].sum() for b in blocks]); cnt = np.array([len(b) for b in blocks])
+            picks = rng.integers(0, len(blocks), (reps, len(blocks)))
+            boot = sums[picks].sum(axis=1) / cnt[picks].sum(axis=1)
+            store.setdefault(name, []).append((sums, cnt, len(blocks)))
+            per_season.append({"model": name, "test_season": seasons[ti], "matches": len(test),
+                               "mean_logloss_diff_vs_market": diff.mean(),
+                               "ci_low": np.quantile(boot, .025), "ci_high": np.quantile(boot, .975)})
+    per_season = pd.DataFrame(per_season)
+
+    overall = []
+    for name, parts in store.items():
+        est = per_season[per_season.model == name].mean_logloss_diff_vs_market.mean()
+        boot = np.zeros(reps)
+        for sums, cnt, nb in parts:
+            pk = rng.integers(0, nb, (reps, nb))
+            boot += sums[pk].sum(axis=1) / cnt[pk].sum(axis=1)
+        boot /= len(parts)
+        sub = per_season[per_season.model == name]
+        overall.append({"model": name, "test_season": "mean of seasons", "matches": int(sub.matches.sum()),
+                        "mean_logloss_diff_vs_market": est,
+                        "ci_low": np.quantile(boot, .025), "ci_high": np.quantile(boot, .975),
+                        "seasons_better_than_market": int((sub.mean_logloss_diff_vs_market < 0).sum()),
+                        "n_seasons": len(sub)})
+    return pd.concat([per_season, pd.DataFrame(overall)], ignore_index=True)
+
+
+# --------------------------------------------------------------------------- #
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--input-dir", type=Path, default=Path("data/football_data/raw"))
+    ap.add_argument("--output-dir", type=Path, default=Path("outputs"))
+    ap.add_argument("--reps", type=int, default=1000)
+    ap.add_argument("--seed", type=int, default=2026)
+    a = ap.parse_args()
+    a.output_dir.mkdir(parents=True, exist_ok=True)
+
+    raw = load_all(a.input_dir)
+    pipeline_audit(raw).to_csv(a.output_dir / "pipeline_audit.csv", index=False)
+    clean = raw[raw.keep].reset_index(drop=True)
+    odds = clean[["oh", "od", "oa"]].to_numpy(dtype=float)
+    P = {m: remove_margin(odds, m) for m in METHODS}
+
+    cal, diff, boots = calibration_and_tier_tests(clean, P, a.reps, a.seed)
+    cal.to_csv(a.output_dir / "bias_by_margin_method_and_bootstrap.csv", index=False)
+    diff.to_csv(a.output_dir / "tier_difference.csv", index=False)
+    primary_vs_exploratory(boots).to_csv(a.output_dir / "primary_vs_exploratory_tests.csv", index=False)
+    paired_model_tests(raw, clean, P["proportional"], a.reps, a.seed).to_csv(
+        a.output_dir / "paired_model_tests.csv", index=False)
+    print(f"Wrote 5 CSVs to {a.output_dir.resolve()}; analysed {len(clean):,} of {len(raw):,} raw rows.")
+
+
+if __name__ == "__main__":
+    main()
